@@ -1,0 +1,452 @@
+#!/usr/bin/env python3
+"""marches-adeps : trouve la prochaine marche ADEPS près d'une adresse.
+
+Source : https://marches.sport-adeps.be (catalogue public des marches ADEPS,
+Fédération Wallonie-Bruxelles). Bibliothèque standard Python uniquement.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import html
+import json
+import math
+import os
+import re
+import shutil
+import ssl
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+VERSION = "0.1.0"
+BASE = "https://marches.sport-adeps.be"
+UA = f"marches-adeps-cli/{VERSION}"
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "marches-adeps"
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "marches-adeps"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+GEOCACHE_FILE = CACHE_DIR / "geocodage.json"
+
+MOIS = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet",
+        "août", "septembre", "octobre", "novembre", "décembre"]
+JOURS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+
+
+class Erreur(Exception):
+    def __init__(self, message: str, code: int = 1):
+        super().__init__(message)
+        self.code = code
+
+
+# --------------------------------------------------------------------------- HTTP
+
+def http_get(url: str, params: dict | None = None, timeout: float = 20) -> str:
+    if params:
+        url = f"{url}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Language": "fr"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        raise Erreur(f"{urllib.parse.urlsplit(url).netloc} a répondu {e.code}")
+    except (urllib.error.URLError, TimeoutError, ssl.SSLError) as e:
+        # Le Python système de macOS (LibreSSL ancien) échoue sur certains serveurs TLS récents :
+        # on réessaie avec curl, toujours présent sur macOS.
+        if isinstance(getattr(e, "reason", e), ssl.SSLError) and shutil.which("curl"):
+            r = subprocess.run(["curl", "-fsSL", "--max-time", str(int(timeout)), "-A", UA,
+                                "-H", "Accept-Language: fr", url], capture_output=True)
+            if r.returncode == 0:
+                return r.stdout.decode("utf-8", "replace")
+        raise Erreur(f"impossible de joindre {urllib.parse.urlsplit(url).netloc} : {e}")
+
+
+def drupal_settings(page: str) -> dict:
+    m = re.search(r'data-drupal-selector="drupal-settings-json">(.*?)</script>', page, re.S)
+    if not m:
+        raise Erreur("structure du site ADEPS inattendue (drupal-settings absent)")
+    return json.loads(m.group(1))
+
+
+def texte(fragment: str) -> str:
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", fragment))).strip()
+
+
+# --------------------------------------------------------------------------- Dates
+
+def date_fr(d: dt.date) -> str:
+    return f"{JOURS[d.weekday()]} {d.day} {MOIS[d.month - 1]} {d.year}"
+
+
+def date_relative(d: dt.date, today: dt.date) -> str:
+    n = (d - today).days
+    if n == 0:
+        return "aujourd'hui"
+    if n == 1:
+        return "demain"
+    if n < 0:
+        return f"il y a {-n} jours"
+    return f"dans {n} jours"
+
+
+def parse_date_arg(s: str, today: dt.date) -> dt.date:
+    s = s.strip().lower()
+    if s in ("aujourd'hui", "aujourdhui", "today"):
+        return today
+    if s in ("demain", "tomorrow"):
+        return today + dt.timedelta(days=1)
+    if s in JOURS:
+        delta = (JOURS.index(s) - today.weekday()) % 7
+        return today + dt.timedelta(days=delta)
+    m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", s)
+    if m:
+        return dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    m = re.fullmatch(r"(\d{1,2})[/.-](\d{1,2})(?:[/.-](\d{2,4}))?", s)
+    if m:
+        year = int(m.group(3)) if m.group(3) else today.year
+        if year < 100:
+            year += 2000
+        d = dt.date(year, int(m.group(2)), int(m.group(1)))
+        if not m.group(3) and d < today:
+            d = d.replace(year=year + 1)
+        return d
+    raise Erreur(f"date non comprise : {s!r} (ex. 29/11, 2026-11-29, dimanche, demain)", 2)
+
+
+# --------------------------------------------------------------------------- Catalogue
+
+def toutes_les_marches() -> list[dict]:
+    """Toutes les marches à venir : la carte sans filtre les contient toutes, avec leurs coordonnées."""
+    page = http_get(BASE + "/catalogue/marches/carte")
+    leaflet = drupal_settings(page).get("leaflet", {})
+    marches = []
+    for carte in leaflet.values():
+        for f in carte.get("features", []):
+            pop = f.get("popup", {}).get("value", "")
+
+            def champ(cls: str) -> str:
+                m = re.search(rf'class="field__item {cls}">(.*?)</div>', pop, re.S)
+                return texte(m.group(1)) if m else ""
+
+            jma = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{2,4})", champ("date"))
+            if not jma:
+                continue
+            annee = int(jma.group(3))
+            jour = dt.date(annee + 2000 if annee < 100 else annee, int(jma.group(2)), int(jma.group(1)))
+            nom = re.search(r"<h2[^>]*>(.*?)</h2>", pop, re.S)
+            lien = re.search(r'href="(/marche/[^"]+)"', pop)
+            marches.append({
+                "id": f.get("entity_id"),
+                "localite": texte(nom.group(1)) if nom else "?",
+                "jour": jour,
+                "activites": champ("activites"),
+                "lieu": champ("location"),
+                "province": champ("province"),
+                "lat": float(f["lat"]),
+                "lon": float(f["lon"]),
+                "url": BASE + lien.group(1) if lien else None,
+            })
+    if not marches:
+        raise Erreur("aucune marche trouvée sur la carte ADEPS (structure du site changée ?)")
+    return marches
+
+
+SECTIONS = {"LIEU", "ORGANISATEUR", "REMARQUES", "Documents utiles", "Informations supplémentaires",
+            "Horaires", "Retrouvez-nous sur les réseaux sociaux", "Enregister mon activité",
+            "Retourner aux résultats de recherche", "Voir la carte / itinéraire", "Affiche", "-"}
+
+
+def details_marche(url: str) -> dict:
+    page = http_get(url)
+    m = re.search(r'<article[^>]*class="full node marche.*?</article>', page, re.S)
+    bloc = m.group(0) if m else page
+    bloc = re.sub(r"(?s)<(script|style)\b.*?</\1>", "", bloc)
+    lignes = [l.strip() for l in html.unescape(re.sub(r"<[^>]+>", "\n", bloc)).splitlines()]
+    lignes = [re.sub(r"\s+", " ", l) for l in lignes if l.strip()]
+
+    def apres(label: str) -> str:
+        for i, l in enumerate(lignes):
+            if l == label and i + 1 < len(lignes):
+                v = lignes[i + 1]
+                return "" if (v.endswith(":") or v in SECTIONS) else v
+        return ""
+
+    def section(titre: str) -> list[str]:
+        try:
+            i = lignes.index(titre)
+        except ValueError:
+            return []
+        out = []
+        for l in lignes[i + 1:]:
+            if l in SECTIONS or l.endswith(":"):
+                break
+            out.append(l)
+        return out
+
+    org = section("ORGANISATEUR")
+    gmaps = re.search(r'href="(https://www\.google\.[a-z.]+/maps/[^"]+)"', bloc)
+    return {
+        "entite": apres("Entité:"),
+        "distances": apres("Marche:"),
+        "rendez_vous": apres("Lieu de rendez-vous:"),
+        "organisateur": org[0] if org else "",
+        "contact": apres("Personne de contact:"),
+        "telephone": apres("Téléphone:"),
+        "remarques": " ".join(section("REMARQUES")),
+        "ign": apres("IGN:"),
+        "infos": section("Informations supplémentaires"),
+        "horaires": " ".join(section("Horaires")),
+        "itineraire": html.unescape(gmaps.group(1)) if gmaps else None,
+    }
+
+
+# --------------------------------------------------------------------------- Géographie
+
+def charger_json(p: Path) -> dict:
+    try:
+        return json.loads(p.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def sauver_json(p: Path, data: dict) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def geocoder(adresse: str) -> dict:
+    cle = re.sub(r"\s+", " ", adresse.strip().lower())
+    cache = charger_json(GEOCACHE_FILE)
+    if cle in cache:
+        return cache[cle]
+    res = None
+    # Photon (OSM) tolère les noms de localités non officiels (anciennes communes, hameaux…)
+    try:
+        data = json.loads(http_get("https://photon.komoot.io/api/",
+                                   {"q": adresse, "limit": 5, "lang": "fr"}))
+        for f in data.get("features", []):
+            p = f["properties"]
+            if p.get("countrycode", "").upper() == "BE":
+                lon, lat = f["geometry"]["coordinates"]
+                rue = " ".join(x for x in (p.get("street"), p.get("housenumber")) if x)
+                ville = " ".join(x for x in (p.get("postcode"), p.get("city") or p.get("name")) if x)
+                res = {"lat": lat, "lon": lon, "libelle": ", ".join(x for x in (rue, ville) if x)}
+                break
+    except (Erreur, ValueError, KeyError):
+        pass
+    if res is None:
+        try:
+            data = json.loads(http_get("https://nominatim.openstreetmap.org/search",
+                                       {"q": adresse, "format": "jsonv2", "countrycodes": "be", "limit": 1}))
+            if data:
+                res = {"lat": float(data[0]["lat"]), "lon": float(data[0]["lon"]),
+                       "libelle": data[0]["display_name"]}
+        except (Erreur, ValueError, KeyError):
+            pass
+    if res is None:
+        raise Erreur(f"adresse introuvable : {adresse!r}. Essayez avec le code postal et la commune, "
+                     "ou passez --position LAT,LON.", 2)
+    cache[cle] = res
+    sauver_json(GEOCACHE_FILE, cache)
+    return res
+
+
+def distance_km(a_lat, a_lon, b_lat, b_lon) -> float:
+    r = 6371.0
+    p1, p2 = math.radians(a_lat), math.radians(b_lat)
+    dp, dl = p2 - p1, math.radians(b_lon - a_lon)
+    h = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(h))
+
+
+def trajets_voiture(origine: dict, marches: list[dict]) -> None:
+    """Ajoute durée/distance en voiture (serveur public OSRM). Silencieux en cas d'échec."""
+    if not marches:
+        return
+    coords = ";".join(f"{p['lon']:.6f},{p['lat']:.6f}" for p in [origine, *marches])
+    try:
+        data = json.loads(http_get(f"https://router.project-osrm.org/table/v1/driving/{coords}",
+                                   {"sources": 0, "annotations": "duration,distance"}))
+    except (Erreur, ValueError):
+        print("avertissement : calcul des trajets en voiture indisponible", file=sys.stderr)
+        return
+    if data.get("code") != "Ok":
+        return
+    for i, m in enumerate(marches, start=1):
+        dur, dist = data["durations"][0][i], data["distances"][0][i]
+        if dur is not None:
+            m["voiture_min"] = round(dur / 60)
+            m["voiture_km"] = round(dist / 1000, 1)
+
+
+# --------------------------------------------------------------------------- Configuration
+
+def position_depuis(args) -> dict:
+    if args.position:
+        try:
+            lat, lon = (float(x) for x in args.position.split(","))
+        except ValueError:
+            raise Erreur("--position attend LAT,LON (ex. 50.694,4.641)", 2)
+        return {"lat": lat, "lon": lon, "libelle": f"{lat:.5f}, {lon:.5f}"}
+    adresse = args.adresse or os.environ.get("MARCHES_ADEPS_ADRESSE") or charger_json(CONFIG_FILE).get("adresse")
+    if not adresse:
+        raise Erreur("aucune adresse : passez --adresse \"rue, code postal commune\" "
+                     "ou enregistrez-en une avec --enregistrer.", 2)
+    return geocoder(adresse)
+
+
+# --------------------------------------------------------------------------- Affichage
+
+def afficher(resultat: dict, complet: bool) -> None:
+    pos = resultat["position"]
+    print(f"Depuis : {pos['libelle']}  (rayon {resultat['rayon_km']:g} km)")
+    if not resultat["jours"]:
+        print("\nAucune marche ADEPS trouvée dans ce rayon sur les dates publiées.")
+        if resultat.get("plus_proche"):
+            m = resultat["plus_proche"]
+            print(f"La plus proche : {m['localite']} le {m['date_fr']} à {m['distance_km']:.1f} km "
+                  f"→ élargissez avec --rayon {math.ceil(m['distance_km'])}.")
+        return
+    for jour in resultat["jours"]:
+        print(f"\n{jour['date_fr'].capitalize()} ({jour['relatif']})")
+        for m in jour["marches"]:
+            trajet = ""
+            if "voiture_min" in m:
+                trajet = f", {m['voiture_min']} min en voiture ({m['voiture_km']:g} km)"
+            print(f"  • {m['localite']} — {m['distance_km']:.1f} km à vol d'oiseau{trajet}")
+            print(f"    {m['activites']} · {m['lieu']}" + (f" ({m['province']})" if m['province'] else ""))
+            d = m.get("details")
+            if d:
+                if d.get("organisateur"):
+                    print(f"    Organisateur : {d['organisateur']}")
+                if d.get("horaires"):
+                    print(f"    Horaires : {d['horaires']}")
+                if complet:
+                    if d.get("contact") or d.get("telephone"):
+                        print(f"    Contact : {' · '.join(x for x in (d['contact'], d['telephone']) if x)}")
+                    if d.get("remarques"):
+                        print(f"    Remarques : {d['remarques']}")
+                    for info in d.get("infos", []):
+                        print(f"    ℹ {info}")
+                    if d.get("ign"):
+                        print(f"    Carte IGN : {d['ign']}")
+                    if d.get("itineraire"):
+                        print(f"    Itinéraire : {d['itineraire']}")
+            if m.get("url"):
+                print(f"    {m['url']}")
+
+
+# --------------------------------------------------------------------------- Programme
+
+def construire_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="marches-adeps",
+        description="Trouve la prochaine marche ADEPS (points verts) près d'une adresse.",
+        epilog="Exemples :\n"
+               "  marches-adeps\n"
+               "  marches-adeps --adresse \"Grand-Place 1, 1348 Louvain-la-Neuve\" --rayon 20\n"
+               "  marches-adeps --toutes --rayon 25 --trajet\n"
+               "  marches-adeps --date dimanche --complet\n"
+               "  marches-adeps --enregistrer --adresse \"Grand-Place 1, 1348 Louvain-la-Neuve\"",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("-a", "--adresse", help="adresse de départ (sinon : $MARCHES_ADEPS_ADRESSE, puis l'adresse enregistrée)")
+    p.add_argument("-p", "--position", metavar="LAT,LON", help="coordonnées de départ au lieu d'une adresse")
+    p.add_argument("-r", "--rayon", type=float, default=30, metavar="KM", help="rayon de recherche à vol d'oiseau (défaut : 30)")
+    p.add_argument("-n", "--nombre", type=int, default=5, metavar="N", help="marches max. par date (défaut : 5)")
+    p.add_argument("-d", "--date", help="une date précise : 29/11, 2026-11-29, dimanche, demain…")
+    p.add_argument("-t", "--toutes", action="store_true", help="toutes les dates publiées, pas seulement la prochaine")
+    p.add_argument("--trajet", action="store_true", help="ajoute la durée en voiture (serveur public OSRM)")
+    p.add_argument("-c", "--complet", action="store_true", help="contact, remarques, infos, carte IGN, itinéraire")
+    p.add_argument("--rapide", action="store_true", help="ne lit pas les pages de détail (pas d'organisateur ni d'horaires)")
+    p.add_argument("--json", action="store_true", help="sortie JSON (pour scripts et agents)")
+    p.add_argument("--dates", action="store_true", help="liste seulement les dates publiées et le nombre de marches")
+    p.add_argument("--enregistrer", action="store_true", help="enregistre --adresse comme adresse par défaut")
+    p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    return p
+
+
+def principal(argv: list[str] | None = None) -> int:
+    args = construire_parser().parse_args(argv)
+    today = dt.date.today()
+
+    if args.enregistrer:
+        if not args.adresse:
+            raise Erreur("--enregistrer demande --adresse", 2)
+        pos = geocoder(args.adresse)
+        cfg = charger_json(CONFIG_FILE)
+        cfg["adresse"] = args.adresse
+        sauver_json(CONFIG_FILE, cfg)
+        print(f"Adresse par défaut enregistrée : {args.adresse}\n  → {pos['libelle']} ({pos['lat']:.5f}, {pos['lon']:.5f})")
+        return 0
+
+    toutes = [m for m in toutes_les_marches() if m["jour"] >= today]
+    par_jour: dict[dt.date, list[dict]] = {}
+    for m in toutes:
+        par_jour.setdefault(m.pop("jour"), []).append(m)
+    dates = sorted(par_jour)
+
+    if args.dates:
+        if args.json:
+            print(json.dumps([{"date": d.isoformat(), "date_fr": date_fr(d), "nombre": len(par_jour[d])}
+                              for d in dates], ensure_ascii=False, indent=2))
+        else:
+            for d in dates:
+                print(f"{date_fr(d):<32} {len(par_jour[d]):>3} marche(s)")
+        return 0
+
+    pos = position_depuis(args)
+    if args.date:
+        cible = parse_date_arg(args.date, today)
+        if cible not in par_jour:
+            raise Erreur(f"aucune marche ADEPS publiée le {date_fr(cible)}.", 1)
+        dates = [cible]
+
+    jours, plus_proche = [], None
+    for d in dates:
+        for m in par_jour[d]:
+            m["distance_km"] = round(distance_km(pos["lat"], pos["lon"], m["lat"], m["lon"]), 1)
+            m["date"], m["date_fr"] = d.isoformat(), date_fr(d)
+            if plus_proche is None or m["distance_km"] < plus_proche["distance_km"]:
+                plus_proche = m
+        proches = sorted((m for m in par_jour[d] if m["distance_km"] <= args.rayon),
+                         key=lambda m: m["distance_km"])[:args.nombre]
+        if proches:
+            jours.append({"date": d.isoformat(), "date_fr": date_fr(d),
+                          "relatif": date_relative(d, today), "marches": proches})
+            if not (args.toutes or args.date):
+                break
+
+    affichees = [m for j in jours for m in j["marches"]]
+    if not args.rapide and affichees:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for m, det in zip(affichees, pool.map(lambda m: details_marche(m["url"]) if m["url"] else None, affichees)):
+                if det:
+                    m["details"] = det
+    if args.trajet:
+        trajets_voiture(pos, affichees)
+
+    resultat = {"position": pos, "rayon_km": args.rayon, "jours": jours,
+                "plus_proche": None if jours else plus_proche, "source": BASE}
+    if args.json:
+        print(json.dumps(resultat, ensure_ascii=False, indent=2))
+    else:
+        afficher(resultat, args.complet)
+    return 0 if jours else 1
+
+
+def main() -> None:
+    try:
+        sys.exit(principal())
+    except Erreur as e:
+        print(f"marches-adeps : {e}", file=sys.stderr)
+        sys.exit(e.code)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
